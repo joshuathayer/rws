@@ -80,7 +80,7 @@ fn add_candidates_to_bitmap(
     for c in candidates {
         match c {
             (freq, time, energy) => {
-                let a = 255 * ((energy * energy) / (max * max)) as u8;
+                let a = (255.0 * (*energy as f32 / max as f32)) as u8;
                 bm[*time][*freq] = (255, 0, 0, a);
 
                 for sync_slot in 0..3 {
@@ -89,6 +89,8 @@ fn add_candidates_to_bitmap(
                             [*freq + (*c as f32 * 2.0) as usize] = (0, 255, 0, a)
                     }
                 }
+                println!("a {}", a);
+                bm[(a as f32 / 8.0) as usize][*freq] = (0, 0, 255, 255);
             }
         }
     }
@@ -337,11 +339,14 @@ fn main() {
     let peak = find_spectral_peak("samples/FT8/191111_110115.wav").unwrap();
     println!("Peak is {} Hz", peak);
 
-    //choppy("samples/FT8/181201_180245.wav");
-    // choppy("../ft8_lib/tests/191111_110130.wav");
+    // choppy("samples/FT8/181201_180245.wav");
+    choppy("../ft8_lib/tests/191111_110130.wav");
     // choppy("../ft8_lib/tests/191111_110145.wav");
     // choppy("../ft8_lib/tests/191111_110630.wav");
-    choppy("../ft8_lib/tests/191111_110645.wav");
+    // choppy("../ft8_lib/tests/191111_110645.wav");
+    // choppy("../ft8_lib/tests/191111_110200.wav");
+    // choppy("../ft8_lib/tests/191111_110215.wav");
+
     // choppy("samples/FT8/191111_110115.wav");
 
     // choppy("sine.wav");
