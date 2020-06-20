@@ -6,6 +6,7 @@ use hound;
 use std::i16;
 
 // use rustfft::FFT;
+use itertools::Itertools;
 
 use ndarray::Array2;
 use rustfft::num_complex::Complex;
@@ -89,7 +90,6 @@ fn add_candidates_to_bitmap(
                             [*freq + (*c as f32 * 2.0) as usize] = (0, 255, 0, a)
                     }
                 }
-                println!("a {}", a);
                 bm[(a as f32 / 8.0) as usize][*freq] = (0, 0, 255, 255);
             }
         }
@@ -129,6 +129,121 @@ fn write_bitmap(filename: &str, input: &Vec<Vec<(u8, u8, u8, u8)>>) {
     writer.write_image_data(&data).unwrap(); // Save
 }
 
+fn build_spectra(
+    signal: &Vec<Complex<f32>>,
+    chopcount: u32,
+    chopsize: u32,
+    stepsize: u32,
+) -> Vec<Vec<Complex<f32>>> {
+    // make a 2D array of (time-overlapping) FFTs
+    println!("chopcount {}", chopcount);
+    let mut planner = FFTplanner::new(false);
+
+    let fft = planner.plan_fft((chopsize * 2) as usize);
+
+    let spectra = (0..chopcount)
+        .map(|c| {
+            let offset = c * stepsize;
+
+            let mut sig: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
+            let mut spectrum: Vec<Complex<f32>> = vec![Complex::zero(); (chopsize * 2) as usize];
+
+            sig.copy_from_slice(&signal[offset as usize..(offset + chopsize) as usize]);
+            let zeros: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
+
+            sig.extend_from_slice(&zeros);
+
+            fft.process(&mut sig, &mut spectrum[..]);
+
+            spectrum
+        })
+        .collect::<Vec<_>>();
+
+    spectra
+}
+
+// returns a vec of tuples of (frequeny_index, max_time_index, power_at_max)
+fn find_strongest_costas_for_time(result: &Array2<f32>) -> Vec<(usize, usize, f32)> {
+    let mut res = Vec::new();
+
+    for (freq_i, f_row) in result.genrows().into_iter().enumerate() {
+        let top_time =
+            f_row
+                .iter()
+                .enumerate()
+                .fold((freq_i, 0, 0.0), |(freq_i, max_i, max), (i, v)| {
+                    if v > &max {
+                        (freq_i, i, *v)
+                    } else {
+                        (freq_i, max_i, max)
+                    }
+                });
+        res.push(top_time);
+    }
+
+    res
+}
+
+// for every potential starting point (in time and freq),
+// find the "costas value" for that point.
+fn find_costas_powers(
+    spectra: &Vec<Vec<Complex<f32>>>,
+    top_freq: f32,
+    binwidth: f32,
+) -> Array2<f32> {
+    // number of base frequencies we're going to consider
+    let steps = (top_freq / 3.125) as u32;
+
+    println!("Frequency steps {}", steps);
+
+    // spec says 2 seconds before and 3 seconds after, but we don't have that much data!
+    // we have exactly 15 seconds of data. message is 12.94 seconds. so we only have an extra 2.06 seconds...
+    let start_times = ((1.0 / 0.04) + (1.0 / 0.04)) as usize;
+    println!("Start times (time steps): {}", start_times);
+
+    let mut result = Array2::zeros((steps as usize, start_times));
+
+    // it seems like nested `for...` loops are more idiomatic rust, but...
+    (0..steps)
+        .cartesian_product(0..start_times)
+        .for_each(|(fq_step, time_step)| {
+            // for-each is side-effecting/non-lazy map
+
+            let base_fq = fq_step as f32 * 3.125;
+            let base_time = time_step;
+
+            let mut sum = 0.0;
+            let mut normal = 0.0;
+
+            for sync_slot in 0..3 {
+                for (i, c) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
+                    // the costas freq at time i
+                    let c_fq = base_fq as f32 + (*c as f32 * 6.25);
+
+                    let bin = (c_fq / binwidth) as usize;
+                    let energy =
+                        spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
+
+                    sum = sum + energy;
+                }
+
+                // normalizing sum
+                // the spectral content of the 7 lowest frequency bins
+                for (i, _) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
+                    for bin in 0..6 {
+                        let energy =
+                            spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
+                        normal = normal + energy;
+                    }
+                }
+            }
+
+            result[[fq_step as usize, time_step as usize]] = sum / normal;
+        });
+
+    result
+}
+
 fn choppy(fname: &str) -> () {
     let mut reader = hound::WavReader::open(fname).expect("Failed to open WAV file");
     let spec = reader.spec();
@@ -156,41 +271,22 @@ fn choppy(fname: &str) -> () {
         binwidth
     );
 
-    let mut planner = FFTplanner::new(false);
-
     let signal = reader
         .samples::<i16>()
         .map(|x| Complex::new(x.unwrap() as f32, 0f32))
         .collect::<Vec<_>>();
 
-    // make a (time-)overlapping grid of FFTs
-    println!("chopcount {}", chopcount);
-    let fft = planner.plan_fft((chopsize * 2) as usize);
-
     println!("building spectra...");
-    let spectra = (0..chopcount)
-        .map(|c| {
-            let offset = c * stepsize;
 
-            let mut sig: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
-            let mut spectrum: Vec<Complex<f32>> = vec![Complex::zero(); (chopsize * 2) as usize];
-
-            sig.copy_from_slice(&signal[offset as usize..(offset + chopsize) as usize]);
-            let zeros: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
-
-            sig.extend_from_slice(&zeros);
-
-            fft.process(&mut sig, &mut spectrum[..]);
-
-            spectrum
-        })
-        .collect::<Vec<_>>();
+    // spectra will be a 2D array of (time-overlapping) FFTs
+    let spectra = build_spectra(&signal, chopcount, chopsize, stepsize);
 
     println!(
         "A spectrum is of length {} ({} reals)",
         spectra[0].len(),
         spectra[0].len() / 2
     );
+
     // spectra is a 2D array of [time][freq] -> power
     let mut bm = spectra_to_bitmap(&spectra);
 
@@ -200,86 +296,34 @@ fn choppy(fname: &str) -> () {
     let top_of_passband = 2600.0;
     let last_step = top_of_passband - (6.0 * 6.25);
 
-    // number of base frequencies we're going to consider
-    let steps = (last_step / 3.125) as u32;
-
     println!("searching...");
 
-    let mut res = Vec::new();
-
-    println!("Frequency steps {}", steps);
-
-    // spec says 2 seconds before and 3 seconds after, but we don't have that much data!
-    // we have exactly 15 seconds of data. message is 12.94 seconds. so we only have an extra 2.06 seconds...
-    let start_times = ((1.0 / 0.04) + (1.0 / 0.04)) as usize;
-    println!("Start times (time steps): {}", start_times);
-
-    // do the search
-    let mut result = Array2::zeros((steps as usize, start_times));
-
-    // step through base frequencies
-    for step in 0..steps {
-        let base_fq = step as f32 * 3.125;
-
-        // these are time steps
-        for base_time in 0..start_times {
-            // base_fq is the 0 freq for our costas array
-
-            // assume there's a costa array based at (base_time,
-            // base_fq). let's take the energy of it.
-
-            let mut sum = 0.0;
-            let mut normal = 0.0;
-
-            for sync_slot in 0..3 {
-                for (i, c) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
-                    let c_fq = base_fq as f32 + (*c as f32 * 6.25); // the costas freq at time i
-                    let bin = (c_fq / binwidth) as usize;
-                    let energy =
-                        spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
-                    sum = sum + energy;
-                }
-
-                // normalizing sum
-                // the spectral content of the 7 lowest frequency bins
-                for (i, _) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
-                    for bin in 0..6 {
-                        let energy =
-                            spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
-                        normal = normal + energy;
-                    }
-                }
-            }
-
-            result[[step as usize, base_time as usize]] = sum / normal;
-        }
-    }
+    let result = find_costas_powers(&spectra, last_step, binwidth);
 
     // result is base_freq x base_time
-    // for every frequency, there's a starting time which had the most power
-    for (freq_i, f_row) in result.genrows().into_iter().enumerate() {
-        let top_time =
-            f_row
-                .iter()
-                .enumerate()
-                .fold((freq_i, 0, 0.0), |(freq_i, max_i, max), (i, v)| {
-                    if v > &max {
-                        (freq_i, i, *v)
-                    } else {
-                        (freq_i, max_i, max)
-                    }
-                });
-        res.push(top_time);
-    }
+    // for every frequency, there's a starting time which had the most power.
+    // res will be a vec of tuples of
+    // (frequency_index, max_time_index, power_at_max)
+    let res = find_strongest_costas_for_time(&result);
 
-    // hmm maybe not quite, read the pdf...
+    // PDF suggests we filter to values 1.5 times over the median.
+    // but mean makes more sense to me? anywhere here's both.
     let mean: f32 = res
         .iter()
         .map(|(_, _, e)| *e as f32)
         .fold(0.0, |acc, e| acc + e)
         / res.len() as f32;
 
-    let threshold = 10.0;
+    let ordered = res
+        .iter()
+        .sorted_by(|(_, _, a), (_, _, b)| b.partial_cmp(a).unwrap())
+        .collect::<Vec<_>>();
+
+    let median = ordered[(res.len() / 2) as usize];
+
+    // let threshold = 10.0;
+    let threshold = median.2 * 1.5;
+    println!("threshold {}", threshold);
     let candidates = res
         .iter()
         .filter(|(_, _, e)| (*e / mean) > threshold)
@@ -289,7 +333,6 @@ fn choppy(fname: &str) -> () {
 
     println!("length of res {}", res.len());
     println!("length of candidates {}", candidates.len());
-    println!("candidate (freq_index, time_index, energy) tuples:");
 
     println!("done");
 
