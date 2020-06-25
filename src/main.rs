@@ -101,6 +101,15 @@ fn add_candidates_to_bitmap(
         }
     }
 
+    // add some frequencies to this bitmap too, why not
+    let w = bm[0].len();
+    let dw = w / 100;
+    for x in 0..dw {
+        for y in 0..20 {
+            bm[y][x * 100] = (255, 255, 0, 255);
+        }
+    }
+
     ()
 }
 
@@ -198,9 +207,12 @@ fn find_costas_powers(
     binwidth: f32,
 ) -> Array2<f32> {
     // number of base frequencies we're going to consider
-    let steps = (top_freq / 3.125) as u32;
+    let steps = (top_freq / binwidth) as u32;
 
-    println!("Frequency steps {}", steps);
+    println!(
+        "Frequency steps {} (0 to {}, 3.125Hz each) {}",
+        steps, top_freq, binwidth
+    );
 
     // spec says 2 seconds before and 3 seconds after, but we don't have that much data!
     // we have exactly 15 seconds of data. message is 12.94 seconds. so we only have an extra 2.06 seconds...
@@ -255,8 +267,6 @@ fn costas(
     sample_len: u32,
     sample_rate: u32,
 ) -> Vec<(usize, usize, f32)> {
-    // reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>
-
     println!("Read rate {}", sample_rate);
     println!(
         "Samples {} so time {}s",
@@ -365,6 +375,9 @@ fn fine_process(
     signal.extend_from_slice(&zeros);
     let mut spectrum = signal.clone();
 
+    let total_samples = spectrum.len();
+    let bins = total_samples;
+
     let fft = planner.plan_fft(spectrum.len() as usize);
     let ifft = iplanner.plan_fft(spectrum.len() as usize);
 
@@ -372,14 +385,21 @@ fn fine_process(
 
     // ok, for each candidate base frequency f,
     // we chop out f-6.25 to f+50 from the full fft
-    let binwidth = 3.125;
+    // let binwidth = 3.125;
+    let binwidth = (sample_rate as f32 / 2.0) / total_samples as f32;
+    println!(
+        "BINWIDTH {} ({} bins) spectrum length {}",
+        binwidth,
+        bins,
+        spectrum.len()
+    );
     for (f, t, p) in candidates {
-        let min = cmp::max(0, f - ((6.25 / binwidth) as usize));
-        let max = f + ((50.0 / binwidth) as usize); // XXX jt overflow
-
-        // xxx jt you are here
-        // how can we generate 16 seconds of signal with such a small slice of spectrum?
-        // let mut spectrum_slice: Vec<Complex<f32>> = vec![Complex::zero(); max - min];
+        let min = cmp::max(
+            0,
+            (*f as f32 / binwidth) as usize - ((6.25 / binwidth) as usize),
+        );
+        let max = (*f as f32 / binwidth) as usize + ((50.0 / binwidth) as usize); // XXX jt overflow
+                                                                                  // xxx jt you are here
         let mut spectrum_slice_0: Vec<Complex<f32>> = vec![Complex::zero(); min];
         let mut spectrum_slice_1: Vec<Complex<f32>> = vec![Complex::zero(); max - min];
         let mut spectrum_slice_2: Vec<Complex<f32>> =
@@ -387,58 +407,22 @@ fn fine_process(
 
         let mut generated_signal = vec![Complex::zero(); signal.len()];
 
-        // spectrum_slice_1.copy_from_slice(&spectrum[min..max]);
-        // spectrum_slice_0.extend(spectrum_slice_1);
-        // spectrum_slice_0.extend(spectrum_slice_2);
+        spectrum_slice_1.copy_from_slice(&spectrum[min..max]);
+        spectrum_slice_0.extend(spectrum_slice_1);
+        spectrum_slice_0.extend(spectrum_slice_2);
+
         let mut spectrum_copy: Vec<Complex<f32>> = spectrum.clone();
 
-        println!("Doing inverse...");
-        //ifft.process(&mut spectrum_slice_0, &mut generated_signal);
-        ifft.process(&mut spectrum_copy, &mut generated_signal);
+        ifft.process(&mut spectrum_slice_0, &mut generated_signal);
+        // ifft.process(&mut spectrum_copy, &mut generated_signal);
 
         let reals = generated_signal[..generated_signal.len() as usize]
             .into_iter()
             .map(|v| ((v.re / (generated_signal.len() as f32)) as u16))
             .collect::<Vec<u16>>();
 
-        // let scaled = reals.map(|v| ((v / m) * 2.0) - 1.0);
-
         write_wav(&reals, *f);
-
-        //println!("Did inverse. {} {:?}", generated_signal.len(), reals);
     }
-
-    // fn find_spectral_peak(filename: &str) -> Option<f32> {
-    //     let mut reader = hound::WavReader::open(filename).expect("Failed to open WAV file");
-    //     let num_samples = reader.len() as usize;
-    //     let mut planner = FFTplanner::new(false);
-
-    //     let sample_rate = reader.spec().sample_rate;
-
-    //     let fft = planner.plan_fft(num_samples);
-
-    //     let mut signal = reader
-    //         .samples::<i16>()
-    //         .map(|x| Complex::new(x.unwrap() as f32, 0f32))
-    //         .collect::<Vec<_>>();
-
-    //     let mut spectrum = signal.clone();
-
-    //     fft.process(&mut signal[..], &mut spectrum[..]);
-
-    //     let max_peak = spectrum
-    //         .iter()
-    //         .take(num_samples / 2)
-    //         .enumerate()
-    //         .max_by_key(|&(_, freq)| freq.norm() as u32);
-
-    //     if let Some((i, _)) = max_peak {
-    //         let bin = sample_rate as f32 / num_samples as f32;
-    //         Some(i as f32 * bin)
-    //     } else {
-    //         None
-    //     }
-    // }
 }
 
 fn choppy(fname: &str) -> (Vec<num::Complex<f32>>, u32, u32) {
@@ -466,14 +450,14 @@ fn main() {
 
     let (signal, sample_len, rate) =
     // choppy("samples/FT8/181201_180245.wav");
-    choppy("../ft8_lib/tests/191111_110130.wav");
-    // choppy("../ft8_lib/tests/191111_110145.wav");
-    // choppy("../ft8_lib/tests/191111_110630.wav");
+    // choppy("../ft8_lib/tests/191111_110130.wav");
+     choppy("../ft8_lib/tests/191111_110145.wav");
+    //  choppy("../ft8_lib/tests/191111_110630.wav");
     // choppy("../ft8_lib/tests/191111_110645.wav");
     // choppy("../ft8_lib/tests/191111_110200.wav");
     // choppy("../ft8_lib/tests/191111_110215.wav");
-
     // choppy("samples/FT8/191111_110115.wav");
+
     let mut candidates: std::vec::Vec<(usize, usize, f32)> = costas(&signal, sample_len, rate);
     candidates.sort_by(|(_, _, l), (_, _, r)| r.partial_cmp(l).unwrap());
     println!("{:?}", candidates);
