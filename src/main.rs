@@ -44,12 +44,12 @@ fn write_wav(bytes: &Vec<u16>, t: usize) -> () {
 fn spectra_to_bitmap(spectra: &[Vec<Complex<f32>>]) -> Vec<Vec<(u8, u8, u8, u8)>> {
     let height = spectra.len() as u32;
     let width = (spectra[0].len() / 2) as u32;
-
     let mut max: f32 = 0.0;
+
     for y in 0..height {
         for x in 0..width {
-            if spectra[y as usize][x as usize].norm_sqr() > max {
-                max = spectra[y as usize][x as usize].norm_sqr();
+            if spectra[y as usize][x as usize].norm() > max {
+                max = spectra[y as usize][x as usize].norm();
             }
         }
     }
@@ -58,9 +58,17 @@ fn spectra_to_bitmap(spectra: &[Vec<Complex<f32>>]) -> Vec<Vec<(u8, u8, u8, u8)>
 
     for y in 0..height {
         let mut row: Vec<(u8, u8, u8, u8)> = Vec::new();
+
         for x in 0..width {
-            let v = ((spectra[y as usize][x as usize].norm_sqr() / max) * 255.0) as u8;
-            row.push((v / 2, v / 2, v, 255u8));
+            // normalize to 0,1.0
+            let v = spectra[y as usize][x as usize].norm() / max;
+
+            // we'll use an black-green spectrum
+            let b = (0.0 * 255.0) as u8;
+            let r = (0.0 * 255.0) as u8;
+            let g = (v * 255.0) as u8;
+
+            row.push((r, g, b, 255u8));
         }
         cols.push(row);
     }
@@ -86,27 +94,34 @@ fn add_candidates_to_bitmap(
 
     for c in candidates {
         match c {
-            (freq, time, energy) => {
+            (bin, time, energy) => {
                 let a = (255.0 * (*energy as f32 / max as f32)) as u8;
-                bm[*time][*freq] = (255, 0, 0, a);
+                bm[*time][*bin] = (255, 0, 0, a);
 
                 for sync_slot in 0..3 {
                     for (i, c) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
                         bm[(sync_slot * 36 * 4) + *time + (i * 4)]
-                            [*freq + (*c as f32 * 2.0) as usize] = (0, 255, 0, a)
+                            [*bin + (*c as f32 * 2.0) as usize] = (0, 255, 0, a)
                     }
                 }
-                bm[(a as f32 / 8.0) as usize][*freq] = (0, 0, 255, 255);
+
+                bm[(a as f32 / 8.0) as usize][*bin] = (255, 255, 255, 255);
             }
         }
     }
 
     // add some frequencies to this bitmap too, why not
     let w = bm[0].len();
-    let dw = w / 100;
+
+    // each step is 3.12Hz
+    // if we want to make a mark every 100Hz, that's every 100 / 3.125 bins
+    let hz_in_bins = 100 as usize;
+    let dw = w / (hz_in_bins as f32 / 3.125) as usize;
     for x in 0..dw {
-        for y in 0..20 {
-            bm[y][x * 100] = (255, 255, 0, 255);
+        let bonus = (20 - (x % 10)) * 4;
+
+        for y in 0..(3 + bonus) {
+            bm[y][x * (hz_in_bins as f32 / 3.125) as usize] = (255, 255, 0, 255);
         }
     }
 
@@ -145,30 +160,43 @@ fn write_bitmap(filename: &str, input: &Vec<Vec<(u8, u8, u8, u8)>>) {
 }
 
 fn build_spectra(
-    signal: &Vec<Complex<f32>>,
-    chopcount: u32,
-    chopsize: u32,
-    stepsize: u32,
+    signal: &Vec<Complex<f32>>, // original signal
+    stepcount: u32,             // number of time steps
+    samples_per_step: u32,      // size of sample per time step
+    stepsize: u32,              // number of samples to advance every step
 ) -> Vec<Vec<Complex<f32>>> {
     // make a 2D array of (time-overlapping) FFTs
-    println!("chopcount {}", chopcount);
+    println!(
+        "time steps {}, time step size {} ({}s)",
+        stepcount,
+        samples_per_step,
+        samples_per_step as f32 / 12000.0
+    );
+
     let mut planner = FFTplanner::new(false);
 
-    let fft = planner.plan_fft((chopsize * 2) as usize);
+    // *2 because we're going to pad
+    let fft = planner.plan_fft((samples_per_step * 2) as usize);
 
-    let spectra = (0..chopcount)
+    let spectra = (0..stepcount)
         .map(|c| {
             let offset = c * stepsize;
 
-            let mut sig: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
-            let mut spectrum: Vec<Complex<f32>> = vec![Complex::zero(); (chopsize * 2) as usize];
+            // the input signal to our FFT.
+            let mut sig: Vec<Complex<f32>> = vec![Complex::zero(); samples_per_step as usize];
 
-            sig.copy_from_slice(&signal[offset as usize..(offset + chopsize) as usize]);
-            let zeros: Vec<Complex<f32>> = vec![Complex::zero(); chopsize as usize];
+            // the output of our FFT. *2 because we're padding
+            let mut spectrum: Vec<Complex<f32>> =
+                vec![Complex::zero(); (samples_per_step * 2) as usize];
 
+            // copy a slice of source signal into sig
+            sig.copy_from_slice(&signal[offset as usize..(offset + samples_per_step) as usize]);
+
+            // pad the slice with zeros
+            let zeros: Vec<Complex<f32>> = vec![Complex::zero(); samples_per_step as usize];
             sig.extend_from_slice(&zeros);
 
-            fft.process(&mut sig, &mut spectrum[..]);
+            fft.process(&mut sig, &mut spectrum);
 
             spectrum
         })
@@ -210,7 +238,7 @@ fn find_costas_powers(
     let steps = (top_freq / binwidth) as u32;
 
     println!(
-        "Frequency steps {} (0 to {}, 3.125Hz each) {}",
+        "Frequency steps {} (0 to {}, {}Hz each)",
         steps, top_freq, binwidth
     );
 
@@ -225,8 +253,6 @@ fn find_costas_powers(
     (0..steps)
         .cartesian_product(0..start_times)
         .for_each(|(fq_step, time_step)| {
-            // for-each is side-effecting/non-lazy map
-
             let base_fq = fq_step as f32 * 3.125;
             let base_time = time_step;
 
@@ -235,12 +261,11 @@ fn find_costas_powers(
 
             for sync_slot in 0..3 {
                 for (i, c) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
-                    // the costas freq at time i
+                    // the costas freq at time i in bin bin
                     let c_fq = base_fq as f32 + (*c as f32 * 6.25);
 
                     let bin = (c_fq / binwidth) as usize;
-                    let energy =
-                        spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
+                    let energy = spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm();
 
                     sum = sum + energy;
                 }
@@ -250,7 +275,7 @@ fn find_costas_powers(
                 for (i, _) in [3, 1, 4, 0, 6, 5, 2].iter().enumerate() {
                     for bin in 0..6 {
                         let energy =
-                            spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm_sqr();
+                            spectra[base_time + (sync_slot * 36 * 4) + (i * 4)][bin].norm();
                         normal = normal + energy;
                     }
                 }
@@ -279,14 +304,12 @@ fn costas(
     let chopcount = (sample_len / stepsize) - 3;
 
     // this is the width in Hz of each element in the FFT result
-    // our nyquist freq is sample_rate / 2, so 6kHz
-    // our FFT will have `chopsize` * 2 bins (`chopsize` usable)
-    let binwidth = (sample_rate as f32 / 2.0) / chopsize as f32;
+    let binwidth = sample_rate as f32 / (chopsize * 2) as f32; // * 2 bc we pad
 
     println!(
         "Covering {}Hz over {} bins, so {} Hz per bin",
         sample_rate / 2,
-        chopsize,
+        chopsize * 2,
         binwidth
     );
 
@@ -295,11 +318,7 @@ fn costas(
     // spectra will be a 2D array of (time-overlapping) FFTs
     let spectra = build_spectra(&signal, chopcount, chopsize, stepsize);
 
-    println!(
-        "A spectrum is of length {} ({} reals)",
-        spectra[0].len(),
-        spectra[0].len() / 2
-    );
+    println!("A spectrum is of length {}", spectra[0].len());
 
     // spectra is a 2D array of [time][freq] -> power
     let mut bm = spectra_to_bitmap(&spectra);
@@ -307,8 +326,8 @@ fn costas(
     // these will be our starting frequencies for searching.
     // since each there are 6 costas freq and each is 6.25Hz above the previous,
     // we want to end on (max freq in our passband) - (6 * 6.25)
-    let top_of_passband = 2600.0;
-    let last_step = top_of_passband - (6.0 * 6.25);
+    let top_of_passband = 5000.0;
+    let last_step = top_of_passband; //  - (6.0 * 6.25);
 
     println!("searching...");
 
@@ -344,6 +363,12 @@ fn costas(
         .copied()
         .collect::<Vec<_>>();
 
+    let as_freq = candidates
+        .iter()
+        .map(|(f, t, e)| ((*f as f32 * binwidth) as usize, *t, *e))
+        .collect::<Vec<_>>();
+
+    // add_candidates_to_bitmap(&mut bm, &as_freq);
     add_candidates_to_bitmap(&mut bm, &candidates);
 
     println!("length of res {}", res.len());
@@ -445,24 +470,23 @@ fn main() {
     //     sqr_sum + sample * sample
     // });
 
-    // let peak = find_spectral_peak("samples/FT8/191111_110115.wav").unwrap();
-    // println!("Peak is {} Hz", peak);
-
     let (signal, sample_len, rate) =
     // choppy("samples/FT8/181201_180245.wav");
     // choppy("../ft8_lib/tests/191111_110130.wav");
-     choppy("../ft8_lib/tests/191111_110145.wav");
+    // choppy("../ft8_lib/tests/191111_110145.wav");
     //  choppy("../ft8_lib/tests/191111_110630.wav");
     // choppy("../ft8_lib/tests/191111_110645.wav");
     // choppy("../ft8_lib/tests/191111_110200.wav");
     // choppy("../ft8_lib/tests/191111_110215.wav");
+    choppy("../ft8_lib/tests/191111_110615.wav");
+    // choppy("3-4-5000hz.wav");
     // choppy("samples/FT8/191111_110115.wav");
 
     let mut candidates: std::vec::Vec<(usize, usize, f32)> = costas(&signal, sample_len, rate);
     candidates.sort_by(|(_, _, l), (_, _, r)| r.partial_cmp(l).unwrap());
-    println!("{:?}", candidates);
+    // println!("{:?}", candidates);
 
-    fine_process(&signal, sample_len, rate, &candidates);
+    // fine_process(&signal, sample_len, rate, &candidates);
 
     // choppy("sine.wav");
 }
