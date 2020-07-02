@@ -354,31 +354,63 @@ fn costas(
 
     let median = ordered[(res.len() / 2) as usize];
 
-    let threshold = median.2 * 1.5;
+    //let threshold = median.2 * 1.5;
+    let threshold = mean * 1.5;
     println!("threshold {}", threshold);
 
-    let candidates = res
-        .iter()
-        .filter(|(_, _, e)| (*e / mean) > threshold)
-        .copied()
-        .collect::<Vec<_>>();
+    // let candidates = res
+    //     .iter()
+    //     .filter(|(_, _, e)| (*e / mean) > threshold)
+    //     .copied()
+    //     .collect::<Vec<_>>();
 
-    let as_freq = candidates
+    // take local maxima of those!
+    let mut maxima = Vec::new();
+    let mut last_power: Option<f32> = None;
+    let mut did_push: bool = false;
+
+    for i in 0..res.len() - 1 {
+        match i {
+            0 => {
+                if res[0].2 > res[1].2 && (res[i].2 / mean) > threshold {
+                    maxima.push(res[0].clone());
+                }
+            }
+            _ => {
+                if res[i - 1].2 < res[i].2
+                    && res[i].2 > res[i + 1].2
+                    && (res[i].2 / mean) > threshold
+                {
+                    did_push = true;
+                    maxima.push(res[i].clone());
+                } else if did_push && res[i].2 == res[i + 1].2 && (res[i].2 / mean) > threshold {
+                    did_push = true;
+                    maxima.push(res[i].clone());
+                } else {
+                    did_push = false;
+                }
+            }
+        }
+    }
+    println!("maxima {:?}", maxima);
+
+    let as_freq = maxima
         .iter()
-        .map(|(f, t, e)| ((*f as f32 * binwidth) as usize, *t, *e))
+        .map(|(f, t, e)| (*f as f32 * binwidth, *e))
         .collect::<Vec<_>>();
 
     // add_candidates_to_bitmap(&mut bm, &as_freq);
-    add_candidates_to_bitmap(&mut bm, &candidates);
+    // add_candidates_to_bitmap(&mut bm, &candidates);
+    add_candidates_to_bitmap(&mut bm, &maxima);
 
-    println!("length of res {}", res.len());
-    println!("length of candidates {}", candidates.len());
+    // println!("length of res {}", res.len());
+    // println!("length of candidates {}", maxima.len());
 
     println!("done");
 
     write_bitmap("waterfall.png", &bm);
 
-    candidates
+    maxima
 }
 
 // fn fine_process(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>) -> () {
@@ -386,7 +418,7 @@ fn fine_process(
     original_signal: &Vec<num::Complex<f32>>,
     num_samples: u32,
     sample_rate: u32,
-    candidates: &Vec<(usize, usize, f32)>, // (fq, time, power) triples
+    candidates: &Vec<(usize, usize, f32)>, // (fq bin, time, power) triples
 ) -> () {
     let mut signal = original_signal.clone();
 
@@ -486,7 +518,7 @@ fn main() {
     candidates.sort_by(|(_, _, l), (_, _, r)| r.partial_cmp(l).unwrap());
     // println!("{:?}", candidates);
 
-    // fine_process(&signal, sample_len, rate, &candidates);
+    fine_process(&signal, sample_len, rate, &candidates);
 
     // choppy("sine.wav");
 }
